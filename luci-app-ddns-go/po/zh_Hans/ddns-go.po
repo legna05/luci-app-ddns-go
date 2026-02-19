@@ -60,3 +60,21 @@ msgstr "不启动web服务"
 
 msgid "Delayed Start (seconds)"
 msgstr "开机延时启动（秒）"
+
+msgid "Web Password"
+msgstr "密码"
+
+msgid "Reset Password"
+msgstr "重置密码"
+
+msgid "Current Version"
+msgstr "现在版本"
+
+msgid "Update kernel"
+msgstr "升级核心"
+
+msgid "Apply Password"
+msgstr "修改密码"
+
+msgid "Check Update"
+msgstr "检查更新"
