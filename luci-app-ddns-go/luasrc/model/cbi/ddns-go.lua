@@ -7,6 +7,14 @@ local uci = require "luci.model.uci".cursor()
 local sys = require "luci.sys"
 local http = require "luci.http"
 
+-- 在文件顶部添加重启处理
+local action = luci.http.formvalue("action")
+if action == "restart" then
+    luci.sys.call("/etc/init.d/ddns-go restart >/dev/null 2>&1")
+    luci.http.redirect(luci.dispatcher.build_url("admin/services/ddns-go"))
+    return
+end
+
 m = Map("ddns-go")
 m.title = translate("DDNS-GO")
 m.description = translate("DDNS-GO automatically obtains your public IPv4 or IPv6 address and resolves it to the corresponding domain name service.")..translate("</br>For specific usage, see:")..translate("<a href=\'https://github.com/sirpdboy/luci-app-ddns-go.git' target=\'_blank\'>GitHub @sirpdboy/luci-app-ddns-go </a>")
@@ -49,11 +57,25 @@ o = s:option(Value, "delay", translate("Delayed Start (seconds)"))
 o.datatype = "and(uinteger,min(0))"
 o.default = "60"
 
--- 在基本设置部分添加密码输入框
+-- 在基本设置部分修改密码输入框
 o = s:option(Value, "web_password", translate("Web Password"))
 o.password = true
 o.default = "admin12345"
 o.description = translate("Password for web interface login")
+o.rmempty = true  -- 允许为空
+o.optional = true  -- 可选字段
+
+-- 关键：重写写入方法，不让它保存到UCI
+o.write = function(self, section, value)
+    -- 不保存到UCI，直接返回
+    return
+end
+
+-- 重写读取方法，不从UCI读取
+o.read = function(self, section)
+    -- 返回默认值，不从UCI读取
+    return "admin12345"
+end
 
 o = s:option(Button, "_reset_password", translate("Reset Password"))
 o.inputtitle = translate("Apply Password")
@@ -63,18 +85,6 @@ o.description = translate("Apply the password above and restart service")
 o.write = function(self, section, value)
     -- 获取表单中的密码值
     local new_password = luci.http.formvalue("cbid.ddns-go.config.web_password")
-    local restart = luci.http.formvalue("restart")
-
-    -- 如果是重启确认步骤
-    if restart then
-        if restart == "1" then
-            luci.sys.call("/etc/init.d/ddns-go restart >/dev/null 2>&1")
-            m.message = translate("Service restarted")
-        else
-            m.message = translate("Service not restarted")
-        end
-        return
-    end
 
     -- 验证密码不为空
     if not new_password or new_password == "" then
@@ -91,7 +101,7 @@ o.write = function(self, section, value)
 
     -- 检查结果中是否包含"已重置成功"
     if result:find("已重置成功") then
-        -- 成功，显示确认重启弹窗
+        -- 成功，显示确认重启弹窗，并且YES按钮直接执行重启
         luci.http.write([[
             <div style="
                 position: fixed;
@@ -166,8 +176,8 @@ o.write = function(self, section, value)
                     gap: 15px;
                     margin-top: 10px;
                 ">
-                    <form method="post" style="margin:0;">
-                        <input type="hidden" name="restart" value="1" />
+                    <form method="post" action="/cgi-bin/luci/admin/services/ddns-go" style="margin:0;">
+                        <input type="hidden" name="action" value="restart" />
                         <button type="submit" style="
                             background-color: #4caf50;
                             color: white;
@@ -184,8 +194,7 @@ o.write = function(self, section, value)
                         </button>
                     </form>
 
-                    <form method="post" style="margin:0;">
-                        <input type="hidden" name="restart" value="0" />
+                    <form method="get" action="]] .. luci.http.getenv("REQUEST_URI") .. [[" style="margin:0;">
                         <button type="submit" style="
                             background-color: #6c757d;
                             color: white;
@@ -216,7 +225,6 @@ o.write = function(self, section, value)
                 "></div>
             </div>
         ]])
-        luci.sys.call("/etc/init.d/ddns-go restart >/dev/null 2>&1")
     else
         -- 失败，显示错误信息
         m.message = translate("Reset failed:") .. result
