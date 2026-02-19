@@ -2,6 +2,11 @@
 
 local m, s ,o
 
+local fs = require "nixio.fs"  -- 修正：使用 nixio.fs
+local uci = require "luci.model.uci".cursor()
+local sys = require "luci.sys"
+local http = require "luci.http"
+
 m = Map("ddns-go")
 m.title = translate("DDNS-GO")
 m.description = translate("DDNS-GO automatically obtains your public IPv4 or IPv6 address and resolves it to the corresponding domain name service.")..translate("</br>For specific usage, see:")..translate("<a href=\'https://github.com/sirpdboy/luci-app-ddns-go.git' target=\'_blank\'>GitHub @sirpdboy/luci-app-ddns-go </a>")
@@ -215,6 +220,555 @@ o.write = function(self, section, value)
     else
         -- 失败，显示错误信息
         m.message = translate("Reset failed:") .. result
+    end
+end
+
+-- 获取当前版本函数
+local function get_current_version()
+    local handle = io.popen("/usr/bin/ddns-go -v 2>&1 | head -n1")
+    local version_output = handle:read("*l") or ""
+    handle:close()
+
+    if version_output == "" then
+        return nil
+    end
+
+    -- 去除开头的 'v' 字符
+    version_output = version_output:gsub("^v", "")
+    return version_output
+end
+
+-- 检查更新状态函数
+local function check_update_status()
+    if not fs.access("/usr/bin/ddns-go") then  -- 现在 fs 已经正确定义
+        return {
+            status = "error",
+            message = "ddns-go not found"
+        }
+    end
+
+    local version_before = get_current_version()
+
+    -- 执行更新检查命令
+    local handle = io.popen("/usr/bin/ddns-go -u 2>&1")
+    local output = handle:read("*a")
+    handle:close()
+
+    if not output or output == "" then
+        return {
+            status = "error",
+            message = "empty response"
+        }
+    end
+
+    -- 获取更新后的版本
+    local version_after = get_current_version()
+
+    -- 解析输出结果
+    local update_info = {
+        raw_output = output,
+        version_before = version_before,
+        version_after = version_after,
+        has_update = false,
+        update_successful = false,
+        current_version = "",
+        latest_version = "",
+        status = "unknown",
+        message = output
+    }
+
+    -- 判断是否更新成功（版本变化）
+    if version_before and version_after and version_before ~= version_after then
+        update_info.update_successful = true
+        update_info.has_update = false
+        update_info.status = "updated"
+        update_info.message = string.format("更新成功: %s → %s", version_before, version_after)
+
+    -- 判断是否已是最新版本
+    elseif output:find("Current version") and output:find("is the latest") then
+        update_info.status = "latest"
+        update_info.has_update = false
+        local version_match = output:match("v[%d%.]+")
+        if version_match then
+            update_info.current_version = version_match:gsub("^v", "")
+            update_info.latest_version = update_info.current_version
+        end
+        update_info.message = "已是最新版本 " .. (update_info.current_version or "")
+
+    -- 判断是否有新版本可用
+    elseif output:find("new version") and output:find("available") then
+        update_info.status = "update_available"
+        update_info.has_update = true
+
+        -- 提取版本号
+        local current_version_match = output:match("Current version (v[%d%.]+)")
+        local new_version_match = output:match("new version (v[%d%.]+)")
+
+        if current_version_match then
+            update_info.current_version = current_version_match:gsub("^v", "")
+        elseif version_before then
+            update_info.current_version = version_before
+        end
+
+        if new_version_match then
+            update_info.latest_version = new_version_match:gsub("^v", "")
+        end
+
+        update_info.message = "有新版本可用: " .. (update_info.latest_version or "")
+
+    -- 判断下载是否失败
+    elseif output:find("download") and output:find("failed") then
+        update_info.status = "download_failed"
+        update_info.has_update = false
+        update_info.message = "下载更新失败"
+
+    -- 判断检查是否失败
+    elseif output:find("check") and output:find("failed") or
+           output:find("Error") or
+           output:find("error") or
+           output:find("Exception") or
+           output:find("rate limit") then
+        update_info.status = "check_failed"
+        update_info.has_update = false
+        update_info.message = "检查更新失败: " .. output
+    end
+
+    return update_info
+end
+
+-- 版本信息显示
+o = s:option(DummyValue, "_current_version", translate("Current Version"))
+o.rawhtml = true
+o.cfgvalue = function(self, section)
+    local version = get_current_version()
+    if version then
+        return '<span id="current_version" style="color:green">v' .. version .. '</span>'
+    else
+        return '<span style="color:orange">' .. translate("Unknown") .. '</span>'
+    end
+end
+
+-- 更新按钮
+o = s:option(Button, "_update", translate("Update kernel"))
+o.inputtitle = translate("Check Update")
+o.inputstyle = "apply"
+o.description = translate("Check for updates and update DDNS-GO")
+
+-- 更新按钮（只修改了这一部分，其他代码保持不变）
+o.write = function(self, section, value)
+
+    -- 执行更新检查
+    local info = check_update_status()
+
+    if info then
+        if info.status == "updated" or info.update_successful then
+            -- 更新成功（保持原有的完整弹窗）
+            local html = [[
+                <div style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #4caf50;
+                    border-radius: 12px;
+                    padding: 30px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 450px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                    </style>
+
+                    <h2 style="color: #2e7d32; margin: 0 0 20px 0; font-size: 24px;">
+                        ✅ ]] .. translate("Update Successful") .. [[
+                    </h2>
+
+                    <div style="
+                        background: #f8f9fa;
+                        border: 1px solid #e9ecef;
+                        border-radius: 6px;
+                        padding: 15px;
+                        margin: 0 0 20px 0;
+                        text-align: left;
+                        font-family: monospace;
+                        font-size: 13px;
+                        max-height: 150px;
+                        overflow: auto;
+                        white-space: pre-wrap;
+                        word-break: break-all;
+                    ">]] .. (info.message or ""):gsub("\n", "<br />") .. [[</div>
+
+                    <form method="post" action="]] .. http.getenv("REQUEST_URI") .. [[" style="margin:0;">
+                        <button type="submit" style="
+                            background-color: #4caf50;
+                            color: white;
+                            border: none;
+                            border-radius: 6px;
+                            padding: 12px 30px;
+                            font-size: 16px;
+                            cursor: pointer;
+                        ">]] .. translate("OK") .. [[</button>
+                    </form>
+
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.5);
+                        z-index: -1;
+                    "></div>
+                </div>
+            ]]
+
+            http.write(html)
+            return
+
+        elseif info.status == "update_available" then
+            -- 有可用更新 - 改为居中浮窗，3秒后自动消失
+            local html = [[
+                <div id="auto_notify" style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #2196f3;
+                    border-radius: 12px;
+                    padding: 25px 35px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 400px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                        @keyframes fadeOut {
+                            from { opacity: 1; transform: translate(-50%, -50%); }
+                            to { opacity: 0; transform: translate(-50%, -55%); }
+                        }
+                    </style>
+                    <span style="font-size: 48px; display: block; margin-bottom: 15px;">↻</span>
+                    <h3 style="color: #0b5e9e; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Update Available") .. [[</h3>
+                    <p style="margin: 0; color: #666; font-size: 16px;">]] .. translate("Update available: v") .. (info.latest_version or "") .. [[</p>
+                    <p style="margin: 5px 0 0 0; color: #999; font-size: 14px;">]] .. translate("Click again to update") .. [[</p>
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.3);
+                        z-index: -1;
+                    "></div>
+                </div>
+                <script>
+                    setTimeout(function() {
+                        var el = document.getElementById('auto_notify');
+                        if (el) {
+                            el.style.animation = 'fadeOut 0.3s ease';
+                            setTimeout(function() { el.remove(); }, 300);
+                        }
+                    }, 3000);
+                </script>
+            ]]
+            http.write(html)
+            return
+
+        elseif info.status == "latest" then
+            -- 已是最新版本 - 改为居中浮窗，3秒后自动消失
+            local html = [[
+                <div id="auto_notify" style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #4caf50;
+                    border-radius: 12px;
+                    padding: 25px 35px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 400px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                        @keyframes fadeOut {
+                            from { opacity: 1; transform: translate(-50%, -50%); }
+                            to { opacity: 0; transform: translate(-50%, -55%); }
+                        }
+                    </style>
+                    <span style="font-size: 48px; display: block; margin-bottom: 15px;">✓</span>
+                    <h3 style="color: #2e7d32; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Latest Version") .. [[</h3>
+                    <p style="margin: 0; color: #666; font-size: 16px;">]] .. translate("Already latest version.") .. [[</p>
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.3);
+                        z-index: -1;
+                    "></div>
+                </div>
+                <script>
+                    setTimeout(function() {
+                        var el = document.getElementById('auto_notify');
+                        if (el) {
+                            el.style.animation = 'fadeOut 0.3s ease';
+                            setTimeout(function() { el.remove(); }, 300);
+                        }
+                    }, 3000);
+                </script>
+            ]]
+            http.write(html)
+            return
+
+        elseif info.status == "download_failed" then
+            -- 下载失败 - 改为居中浮窗，3秒后自动消失
+            local html = [[
+                <div id="auto_notify" style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #f44336;
+                    border-radius: 12px;
+                    padding: 25px 35px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 400px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                        @keyframes fadeOut {
+                            from { opacity: 1; transform: translate(-50%, -50%); }
+                            to { opacity: 0; transform: translate(-50%, -55%); }
+                        }
+                    </style>
+                    <span style="font-size: 48px; display: block; margin-bottom: 15px;">✗</span>
+                    <h3 style="color: #d32f2f; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Download Failed") .. [[</h3>
+                    <p style="margin: 0; color: #666; font-size: 14px; max-height: 100px; overflow: auto;">]] .. (info.message or ""):gsub("\n", "<br />") .. [[</p>
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.3);
+                        z-index: -1;
+                    "></div>
+                </div>
+                <script>
+                    setTimeout(function() {
+                        var el = document.getElementById('auto_notify');
+                        if (el) {
+                            el.style.animation = 'fadeOut 0.3s ease';
+                            setTimeout(function() { el.remove(); }, 300);
+                        }
+                    }, 3000);
+                </script>
+            ]]
+            http.write(html)
+            return
+
+        elseif info.status == "check_failed" then
+            -- 检查失败 - 改为居中浮窗，3秒后自动消失
+            local html = [[
+                <div id="auto_notify" style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #ff9800;
+                    border-radius: 12px;
+                    padding: 25px 35px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 400px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                        @keyframes fadeOut {
+                            from { opacity: 1; transform: translate(-50%, -50%); }
+                            to { opacity: 0; transform: translate(-50%, -55%); }
+                        }
+                    </style>
+                    <span style="font-size: 48px; display: block; margin-bottom: 15px;">⚠️</span>
+                    <h3 style="color: #c66900; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Check Failed") .. [[</h3>
+                    <p style="margin: 0; color: #666; font-size: 14px; max-height: 100px; overflow: auto;">]] .. (info.message or ""):gsub("\n", "<br />") .. [[</p>
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.3);
+                        z-index: -1;
+                    "></div>
+                </div>
+                <script>
+                    setTimeout(function() {
+                        var el = document.getElementById('auto_notify');
+                        if (el) {
+                            el.style.animation = 'fadeOut 0.3s ease';
+                            setTimeout(function() { el.remove(); }, 300);
+                        }
+                    }, 3000);
+                </script>
+            ]]
+            http.write(html)
+            return
+
+        else
+            -- 其他状态 - 改为居中浮窗，3秒后自动消失
+            local html = [[
+                <div id="auto_notify" style="
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    z-index: 9999;
+                    background: white;
+                    border: 2px solid #9e9e9e;
+                    border-radius: 12px;
+                    padding: 25px 35px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    max-width: 400px;
+                    width: 90%;
+                    text-align: center;
+                    animation: fadeIn 0.3s ease;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                ">
+                    <style>
+                        @keyframes fadeIn {
+                            from { opacity: 0; transform: translate(-50%, -55%); }
+                            to { opacity: 1; transform: translate(-50%, -50%); }
+                        }
+                        @keyframes fadeOut {
+                            from { opacity: 1; transform: translate(-50%, -50%); }
+                            to { opacity: 0; transform: translate(-50%, -55%); }
+                        }
+                    </style>
+                    <span style="font-size: 48px; display: block; margin-bottom: 15px;">ℹ️</span>
+                    <h3 style="color: #616161; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Update Status") .. [[</h3>
+                    <p style="margin: 0; color: #666; font-size: 14px; max-height: 100px; overflow: auto;">]] .. (info.message or ""):gsub("\n", "<br />") .. [[</p>
+                    <div style="
+                        position: fixed;
+                        top: 0;
+                        left: 0;
+                        right: 0;
+                        bottom: 0;
+                        background: rgba(0,0,0,0.3);
+                        z-index: -1;
+                    "></div>
+                </div>
+                <script>
+                    setTimeout(function() {
+                        var el = document.getElementById('auto_notify');
+                        if (el) {
+                            el.style.animation = 'fadeOut 0.3s ease';
+                            setTimeout(function() { el.remove(); }, 300);
+                        }
+                    }, 3000);
+                </script>
+            ]]
+            http.write(html)
+            return
+        end
+    else
+        -- 失败，显示错误信息 - 改为居中浮窗，3秒后自动消失
+        local html = [[
+            <div id="auto_notify" style="
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 9999;
+                background: white;
+                border: 2px solid #f44336;
+                border-radius: 12px;
+                padding: 25px 35px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                max-width: 400px;
+                width: 90%;
+                text-align: center;
+                animation: fadeIn 0.3s ease;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            ">
+                <style>
+                    @keyframes fadeIn {
+                        from { opacity: 0; transform: translate(-50%, -55%); }
+                        to { opacity: 1; transform: translate(-50%, -50%); }
+                    }
+                    @keyframes fadeOut {
+                        from { opacity: 1; transform: translate(-50%, -50%); }
+                        to { opacity: 0; transform: translate(-50%, -55%); }
+                    }
+                </style>
+                <span style="font-size: 48px; display: block; margin-bottom: 15px;">❌</span>
+                <h3 style="color: #d32f2f; margin: 0 0 10px 0; font-size: 22px;">]] .. translate("Error") .. [[</h3>
+                <p style="margin: 0; color: #666; font-size: 14px;">]] .. translate("Failed to check for updates.") .. [[</p>
+                <div style="
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: rgba(0,0,0,0.3);
+                    z-index: -1;
+                "></div>
+            </div>
+            <script>
+                setTimeout(function() {
+                    var el = document.getElementById('auto_notify');
+                    if (el) {
+                        el.style.animation = 'fadeOut 0.3s ease';
+                        setTimeout(function() { el.remove(); }, 300);
+                    }
+                }, 3000);
+            </script>
+        ]]
+        http.write(html)
+        return
     end
 end
 
